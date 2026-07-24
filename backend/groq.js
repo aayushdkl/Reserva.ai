@@ -49,14 +49,52 @@ const SERVICES_DB = {
   "D-Tan / Blackhead Peel Mask": { price: 600, duration: 30 },
 }
 
-// System prompt is now a function so it can calculate the date dynamically
-const getSystemPrompt =
-  () => `You are Alex, the AI front-desk manager for 'Fade & Blade Barbershop'.
+// Helper to get exact local date, day, and time
+function getNowInfo() {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, "0")
+  const day = String(now.getDate()).padStart(2, "0")
+  const dateStr = `${year}-${month}-${day}`
+
+  const dayNames = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+  ]
+  const dayName = dayNames[now.getDay()]
+
+  const hours = String(now.getHours()).padStart(2, "0")
+  const minutes = String(now.getMinutes()).padStart(2, "0")
+  const timeStr = `${hours}:${minutes}`
+
+  const h12 = now.getHours() % 12 || 12
+  const ampm = now.getHours() >= 12 ? "PM" : "AM"
+  const time12Str = `${h12}:${minutes} ${ampm}`
+
+  return {
+    dateStr,
+    dayName,
+    timeStr,
+    time12Str,
+    nowHours: now.getHours(),
+    nowMinutes: now.getMinutes(),
+  }
+}
+
+// System prompt is now a function so it can calculate the date and time dynamically
+const getSystemPrompt = () => {
+  const { dateStr, dayName, timeStr, time12Str } = getNowInfo()
+  return `You are Alex, the AI front-desk manager for 'Fade & Blade Barbershop'.
 You communicate with customers over WhatsApp. Your job is to answer questions, negotiate bookings, and close appointments.
 
 === BUSINESS INFO ===
 Name: Fade & Blade Barbershop
-Today's Date: ${new Date().toISOString().split("T")[0]} (Always use this as "today" for booking availability).
+Today's Date & Current Time: ${dateStr} (${dayName}), ${time12Str} (${timeStr} 24h format). Always use this as "today" and "now" for booking availability calculations.
 Hours: Mon-Sat, 10:00 AM - 7:00 PM. CLOSED on Sundays — no exceptions, no appointments of any kind on Sundays.
 Payment methods accepted: Cash, Card, eSewa/Khalti (mention if asked)
 Walk-ins: Accepted, but booked customers get priority.
@@ -140,8 +178,13 @@ Categories & Sub-Option Details:
 5. If a customer wants to cancel or reschedule, use modify_booking or cancel_booking.
 6. We are CLOSED every Sunday. If a customer asks for a Sunday date, or if a tool result comes back indicating the shop is closed that day, tell them plainly that we're closed on Sundays and ask them to pick a different day (Monday–Saturday). Never offer or confirm a Sunday appointment.
 7. NEVER write out function names, JSON, code blocks, or any tool/function-call syntax in your reply to the customer. You only have two output channels: (a) the official tool-calling mechanism to invoke a function, or (b) plain natural-language text back to the customer. Nothing else is ever shown to the customer directly — no raw JSON, no "<function=...>" tags, no code of any kind.
+8. AFTER an appointment is booked or confirmed (or when discussing payment), ask the customer: "Would you like to pay online via QR code (eSewa / Khalti / Fonepay) or cash at the shop?"
+9. If the customer indicates they want to pay ONLINE (e.g. saying "online", "QR", "eSewa", "Khalti", "send QR", "pay online"), respond warmly with payment instructions and INCLUDE the tag [SEND_PAYMENT_QR] in your reply (e.g., "Awesome! Here is our official QR code for eSewa / Khalti. [SEND_PAYMENT_QR] Please let us know once paid!"). Also invoke tool set_payment_method with method="online".
+10. If the customer indicates they want to pay CASH at the shop, confirm that cash payment is noted and call set_payment_method with method="cash".
+11. CRITICAL: Never offer or book time slots in the past for today's date (${dateStr}). Current local time is ${time12Str}.
 
 Always act within these rules. Never expose internal function names or business logic to the customer.`
+}
 
 const tools = [
   {
@@ -182,6 +225,20 @@ const tools = [
           time: { type: "string", description: "HH:MM" },
         },
         required: ["services", "date", "time"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_payment_method",
+      description: "Set customer payment method preference (cash or online) for their booking.",
+      parameters: {
+        type: "object",
+        properties: {
+          method: { type: "string", enum: ["cash", "online"] },
+        },
+        required: ["method"],
       },
     },
   },
@@ -270,6 +327,9 @@ async function checkAvailability({ date, services = [] }) {
     }
   }
 
+  const nowInfo = getNowInfo()
+  const isToday = date === nowInfo.dateStr
+
   let reqDuration = 0
   for (const s of services) {
     reqDuration += SERVICES_DB[s]?.duration || 30
@@ -295,9 +355,15 @@ async function checkAvailability({ date, services = [] }) {
     }
   }
 
-  const availableStartTimes = []
+  let availableStartTimes = []
   for (let h = 10; h < 19; h++) {
     for (let m of [0, 30]) {
+      if (isToday) {
+        if (h < nowInfo.nowHours || (h === nowInfo.nowHours && m <= nowInfo.nowMinutes)) {
+          continue
+        }
+      }
+
       let canFit = true
       let checkH = h
       let checkM = m
@@ -369,6 +435,23 @@ async function bookAppointment({ services = [], date, time }, phone, name) {
   }
 }
 
+async function setPaymentMethod({ method }, phone) {
+  const booking = await Booking.findOne({
+    customerPhone: phone,
+    status: { $ne: "cancelled" },
+  }).sort({ _id: -1 })
+
+  if (booking) {
+    booking.payment_method = method
+    if (method === "cash") {
+      booking.payment_status = "unpaid"
+    }
+    await booking.save()
+    return { success: true, booking_id: booking._id.toString(), method }
+  }
+  return { error: "No active booking found for this customer" }
+}
+
 async function modifyBooking({ booking_id, new_date, new_time }) {
   if (isClosedDay(new_date)) {
     return {
@@ -412,6 +495,8 @@ async function executeTool(toolName, args, phone, name) {
   if (toolName === "check_availability") return await checkAvailability(args)
   if (toolName === "book_appointment")
     return await bookAppointment(args, phone, name)
+  if (toolName === "set_payment_method")
+    return await setPaymentMethod(args, phone)
   if (toolName === "modify_booking") return await modifyBooking(args)
   if (toolName === "cancel_booking") return await cancelBooking(args)
   if (toolName === "lookup_customer_bookings")

@@ -10,6 +10,7 @@ const bookingSchema = new mongoose.Schema({
   price: Number, // Total price
   status: { type: String, default: "confirmed" },
   payment_status: { type: String, default: "unpaid" },
+  payment_method: { type: String, default: "cash" },
   createdAt: { type: Date, default: Date.now },
 })
 
