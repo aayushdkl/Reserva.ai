@@ -111,6 +111,7 @@ const COLORS = [
   "#ef4444",
   "#8b5cf6",
   "#06b6d4",
+  "#ec4899",
 ]
 
 // ---------- helpers ----------
@@ -121,7 +122,9 @@ function formatPhone(phone) {
 
 function formatDate(dateStr) {
   if (!dateStr) return "—"
-  const d = new Date(dateStr)
+  const [yyyy, mm, dd] = dateStr.split("-").map(Number)
+  if (!yyyy || !mm || !dd) return dateStr
+  const d = new Date(yyyy, mm - 1, dd)
   if (isNaN(d)) return dateStr
   return d.toLocaleDateString(undefined, {
     weekday: "short",
@@ -156,7 +159,10 @@ function isThisWeek(dateStr) {
 }
 
 function toDateKey(d) {
-  return d.toISOString().slice(0, 10)
+  const yyyy = d.getFullYear()
+  const mm = String(d.getMonth() + 1).padStart(2, "0")
+  const dd = String(d.getDate()).padStart(2, "0")
+  return `${yyyy}-${mm}-${dd}`
 }
 
 // ---------- data hooks ----------
@@ -188,7 +194,6 @@ function useFetchList(path) {
   return { data, loading, error, reload }
 }
 
-// UPDATE: Added workers to daily_hours, and added negotiation/handoff toggles[cite: 1]
 function defaultConfig() {
   return {
     services: SERVICES.map((name) => ({
@@ -202,23 +207,17 @@ function defaultConfig() {
       closed: day === "Sunday",
       open: "10:00",
       close: "19:00",
-      workers: 1, // Determines how many simultaneous bookings are allowed
+      workers: 1,
     })),
     daily_customer_cap: null,
     buffer_minutes: 10,
     manual_override: false,
     approve_before_confirm: false,
     enable_negotiation: false,
-    message_handoff_limit: 20, // Handoff to human after this many messages
+    message_handoff_limit: 20,
   }
 }
 
-// Merges a config fetched/returned from the server with local defaults.
-// IMPORTANT: a freshly-created BusinessConfig document on the server has
-// services/daily_hours as *empty arrays* (schema default), not undefined.
-// A naive {...defaultConfig(), ...json} spread would let those empty
-// arrays silently wipe out the real service/hours lists. So we only take
-// the server's value when it actually has entries in it.
 function mergeConfig(json) {
   const base = defaultConfig()
   const merged = { ...base, ...json }
@@ -289,11 +288,35 @@ function useConfig() {
   return { config, setConfig, loading, saving, error, notFound, save }
 }
 
-// ---------- status stamp ----------
+// ---------- shared UI components ----------
 
 function StatusStamp({ status }) {
   const label = (status || "unknown").toUpperCase()
   return <span className={`stamp stamp--${status}`}>{label}</span>
+}
+
+function Toggle({ checked, onChange, disabled }) {
+  return (
+    <label className="toggle-switch">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={onChange}
+        disabled={disabled}
+      />
+      <span className="toggle-slider"></span>
+    </label>
+  )
+}
+
+function Stat({ label, value, sub }) {
+  return (
+    <div className="stat-card">
+      <div className="stat-card__label">{label}</div>
+      <div className="stat-card__value">{value}</div>
+      {sub && <div className="stat-card__sub">{sub}</div>}
+    </div>
+  )
 }
 
 // ---------- sidebar ----------
@@ -322,7 +345,7 @@ function Sidebar({ active, onSelect, counts }) {
           <div className="sidebar__subtitle">Front Desk Ledger</div>
         </div>
       </div>
-      <nav className="sidebar__nav">
+      <nav className="sidebar__nav custom-scroll">
         {items.map((item) => (
           <button
             key={item.key}
@@ -344,22 +367,12 @@ function Sidebar({ active, onSelect, counts }) {
   )
 }
 
-// ---------- shared stat card ----------
-
-function Stat({ label, value, sub }) {
-  return (
-    <div className="stat-card">
-      <div className="stat-card__label">{label}</div>
-      <div className="stat-card__value">{value}</div>
-      {sub && <div className="stat-card__sub">{sub}</div>}
-    </div>
-  )
-}
+// ---------- analytics logic ----------
 
 function useAnalytics(bookings, events) {
   return useMemo(() => {
     const weekBookings = bookings.filter((b) => isThisWeek(b.date))
-    const todayStr = new Date().toISOString().slice(0, 10)
+    const todayStr = toDateKey(new Date())
     const todayBookings = bookings.filter((b) => b.date === todayStr)
 
     const serviceCounts = {}
@@ -434,11 +447,22 @@ function Overview({ bookings, events, onNavigate }) {
     const now = new Date()
     return bookings
       .filter((b) => b.status !== "cancelled")
-      .filter((b) => new Date(`${b.date}T${b.time || "00:00"}`) >= now)
-      .sort(
-        (x, y) =>
-          new Date(`${x.date}T${x.time}`) - new Date(`${y.date}T${y.time}`),
-      )
+      .filter((b) => {
+        const bDate = b.date.split("-")
+        const bTime = (b.time || "00:00").split(":")
+        const d = new Date(bDate[0], bDate[1] - 1, bDate[2], bTime[0], bTime[1])
+        return d >= now
+      })
+      .sort((x, y) => {
+        const xDate = x.date.split("-")
+        const xTime = (x.time || "00:00").split(":")
+        const yDate = y.date.split("-")
+        const yTime = (y.time || "00:00").split(":")
+        return (
+          new Date(xDate[0], xDate[1] - 1, xDate[2], xTime[0], xTime[1]) -
+          new Date(yDate[0], yDate[1] - 1, yDate[2], yTime[0], yTime[1])
+        )
+      })
       .slice(0, 5)
   }, [bookings])
 
@@ -572,14 +596,14 @@ function CalendarTab({ bookings }) {
   const todayKey = toDateKey(new Date())
 
   return (
-    <div>
+    <div className="calendar-module">
       <div className="panel-heading">
-        <h1>Calendar</h1>
-        <p>Every booking, in chronological order, at a glance.</p>
+        <h1>Calendar & Schedule</h1>
+        <p>Visually track your appointments, availability, and daily agenda.</p>
       </div>
 
       <div className="calendar-layout">
-        <div className="calendar">
+        <div className="calendar-panel custom-scroll">
           <div className="calendar__nav">
             <button
               className="icon-btn"
@@ -623,17 +647,24 @@ function CalendarTab({ bookings }) {
               const dayBookings = byDate[key] || []
               const isSelected = key === selected
               const isToday = key === todayKey
+
               return (
                 <button
                   key={i}
-                  className={`calendar__cell ${isSelected ? "is-selected" : ""} ${isToday ? "is-today" : ""}`}
+                  className={`calendar__cell ${isSelected ? "is-selected" : ""} ${isToday ? "is-today" : ""} ${dayBookings.length > 0 ? "has-bookings" : ""}`}
                   onClick={() => setSelected(key)}
                 >
                   <span className="calendar__daynum">{date.getDate()}</span>
+
                   {dayBookings.length > 0 && (
-                    <span className="calendar__count">
-                      {dayBookings.length}
-                    </span>
+                    <div className="calendar__indicators">
+                      {dayBookings.slice(0, 3).map((_, idx) => (
+                        <span key={idx} className="indicator-dot"></span>
+                      ))}
+                      {dayBookings.length > 3 && (
+                        <span className="indicator-plus">+</span>
+                      )}
+                    </div>
                   )}
                 </button>
               )
@@ -641,35 +672,57 @@ function CalendarTab({ bookings }) {
           </div>
         </div>
 
-        <div className="panel-block calendar__agenda">
-          <div className="panel-block__head">
+        <div className="agenda-panel">
+          <div className="agenda-panel__head">
             <h2>{formatDate(selected)}</h2>
+            <span className="agenda-badge">
+              {selectedBookings.length} Appointments
+            </span>
           </div>
-          {selectedBookings.length === 0 && (
-            <div className="empty-state">No bookings on this day.</div>
-          )}
-          <div className="agenda-list">
-            {selectedBookings.map((b) => (
-              <div className="agenda-row" key={b._id}>
-                <div className="agenda-row__time">
-                  <div className="agenda-row__time-sub">
-                    {formatTime(b.time)}
-                  </div>
-                </div>
-                <div className="agenda-row__body">
-                  <div className="agenda-row__name">
-                    {b.customerName || "Walk-in"}
-                  </div>
-                  <div className="agenda-row__service">
-                    {formatServices(b.services)}
-                  </div>
-                  <div className="agenda-row__phone">
-                    {formatPhone(b.customerPhone)}
-                  </div>
-                </div>
-                <StatusStamp status={b.status} />
+
+          <div className="agenda-timeline-container custom-scroll">
+            {selectedBookings.length === 0 ? (
+              <div className="empty-state empty-state--modern">
+                <div className="empty-icon">📅</div>
+                <h3>Clear Schedule</h3>
+                <p>No bookings scheduled for this day.</p>
               </div>
-            ))}
+            ) : (
+              <div className="agenda-timeline">
+                {selectedBookings.map((b) => (
+                  <div className="timeline-item" key={b._id}>
+                    <div className="timeline-time">{formatTime(b.time)}</div>
+                    <div className="timeline-marker">
+                      <div
+                        className={`timeline-dot timeline-dot--${b.status}`}
+                      ></div>
+                      <div className="timeline-line"></div>
+                    </div>
+                    <div className="timeline-content ticket">
+                      <div className="ticket__header">
+                        <span className="ticket__name">
+                          {b.customerName || "Walk-in"}
+                        </span>
+                        <StatusStamp status={b.status} />
+                      </div>
+                      <div className="ticket__service">
+                        {formatServices(b.services)}
+                      </div>
+                      <div className="ticket__foot">
+                        <span className="ticket__phone">
+                          {formatPhone(b.customerPhone)}
+                        </span>
+                        <span
+                          className={`pay pay--${b.payment_status || "unpaid"}`}
+                        >
+                          {b.payment_status || "unpaid"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1041,7 +1094,7 @@ function ConversationRow({ convo, isOpen, onToggle }) {
         <span className={`convo__chevron ${isOpen ? "is-open" : ""}`}>›</span>
       </button>
       {isOpen && (
-        <div className="convo__thread">
+        <div className="convo__thread custom-scroll">
           {(convo.messages || []).map((m, i) => (
             <div key={i} className={`bubble bubble--${m.role}`}>
               <span className="bubble__role">
@@ -1119,6 +1172,9 @@ function AnalyticsTab({ bookings, events }) {
         "Fade (Skin, Drop, Burst)",
         "Hot Towel Shave",
         "Beard Sculpting & Line-Up",
+        "Wash & Blowout",
+        "Root Touch-Up",
+        "Express Facial / Clean-up",
       ]
       const statuses = [
         "confirmed",
@@ -1181,10 +1237,21 @@ function AnalyticsTab({ bookings, events }) {
         serviceMap[s] = (serviceMap[s] || 0) + 1
       })
     })
-    const serviceMixData = Object.keys(serviceMap).map((k) => ({
-      name: k,
-      value: serviceMap[k],
-    }))
+
+    let sortedMix = Object.keys(serviceMap)
+      .map((k) => ({ name: k, value: serviceMap[k] }))
+      .sort((a, b) => b.value - a.value)
+
+    if (sortedMix.length > 5) {
+      const top5 = sortedMix.slice(0, 5)
+      const others = sortedMix
+        .slice(5)
+        .reduce((sum, item) => sum + item.value, 0)
+      top5.push({ name: "Other Services", value: others })
+      sortedMix = top5
+    }
+
+    const serviceMixData = sortedMix
 
     const started = activeEvents.filter(
       (e) => e.event_type === "started",
@@ -1414,14 +1481,14 @@ function AnalyticsTab({ bookings, events }) {
           </div>
           <div className="chart-wrapper pie-wrapper">
             {metrics.serviceMixData.length > 0 ? (
-              <ResponsiveContainer width="100%" height={280}>
+              <ResponsiveContainer width="100%" height={320}>
                 <PieChart>
                   <Pie
                     data={metrics.serviceMixData}
                     cx="50%"
-                    cy="45%"
-                    innerRadius={60}
-                    outerRadius={90}
+                    cy="40%"
+                    innerRadius={70}
+                    outerRadius={100}
                     paddingAngle={2}
                     dataKey="value"
                   >
@@ -1441,9 +1508,11 @@ function AnalyticsTab({ bookings, events }) {
                   />
                   <Legend
                     verticalAlign="bottom"
-                    height={36}
+                    height={
+                      73
+                    } /* Increased from 40 to accommodate wrapping text */
                     iconType="circle"
-                    wrapperStyle={{ fontSize: "12px" }}
+                    wrapperStyle={{ fontSize: "12px", paddingTop: "10px" }}
                   />
                 </PieChart>
               </ResponsiveContainer>
@@ -1460,14 +1529,14 @@ function AnalyticsTab({ bookings, events }) {
             <h2>Payment Status</h2>
           </div>
           <div className="chart-wrapper pie-wrapper">
-            <ResponsiveContainer width="100%" height={280}>
+            <ResponsiveContainer width="100%" height={320}>
               <PieChart>
                 <Pie
                   data={metrics.paymentData}
                   cx="50%"
-                  cy="45%"
+                  cy="40%"
                   innerRadius={0}
-                  outerRadius={90}
+                  outerRadius={100}
                   dataKey="value"
                 >
                   <Cell fill="#10b981" />
@@ -1480,7 +1549,7 @@ function AnalyticsTab({ bookings, events }) {
                     boxShadow: "0 4px 6px rgba(0,0,0,0.1)",
                   }}
                 />
-                <Legend verticalAlign="bottom" height={36} iconType="circle" />
+                <Legend verticalAlign="bottom" height={40} iconType="circle" />
               </PieChart>
             </ResponsiveContainer>
           </div>
@@ -1491,7 +1560,6 @@ function AnalyticsTab({ bookings, events }) {
 }
 
 // ---------- settings ----------
-// UPDATE: Adding Worker count to hours, plus a new block for AI rules[cite: 1]
 function SettingsTab() {
   const { config, setConfig, loading, saving, error, notFound, save } =
     useConfig()
@@ -1535,142 +1603,163 @@ function SettingsTab() {
   }
 
   return (
-    <div>
-      <div className="panel-heading">
-        <h1>Business Customization</h1>
-        <p>
-          Set your hours, available workers, open services, and AI behaviors.
-        </p>
+    <div className="settings-container">
+      <div className="panel-heading interactive-heading">
+        <div>
+          <h1>Business Customization</h1>
+          <p>
+            Configure operational hours, service availability, and AI behavior.
+          </p>
+        </div>
+        <div className="settings-save">
+          {savedFlash && <span className="settings-save__flash">Saved ✓</span>}
+          <button className="save-btn" onClick={handleSave} disabled={saving}>
+            {saving ? "Saving…" : "Save Changes"}
+          </button>
+        </div>
       </div>
 
       {notFound && (
-        <div className="empty-state empty-state--warning">
+        <div
+          className="empty-state empty-state--warning"
+          style={{ marginBottom: "24px" }}
+        >
           No <code>/api/config</code> route found yet on the server — showing
-          defaults. Add the route shown in the setup notes to save changes for
-          real.
+          defaults.
         </div>
       )}
-      {error && <div className="empty-state empty-state--error">{error}</div>}
-
-      <div className="panel-block">
-        <div className="panel-block__head">
-          <h2>Weekly hours & Workforce</h2>
+      {error && (
+        <div
+          className="empty-state empty-state--error"
+          style={{ marginBottom: "24px" }}
+        >
+          {error}
         </div>
-        <div className="hours-table">
-          {config.daily_hours.map((d) => (
-            <div className="hours-row" key={d.day}>
-              <label className="hours-row__day" style={{ minWidth: "120px" }}>
-                <input
-                  type="checkbox"
-                  checked={!d.closed}
-                  onChange={(e) =>
-                    updateDay(d.day, { closed: !e.target.checked })
-                  }
-                />
-                {d.day}
-              </label>
+      )}
 
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  minWidth: "130px",
-                }}
-              >
-                <span style={{ fontSize: "0.9rem", color: "#6b7280" }}>
-                  Workers:
-                </span>
-                <input
-                  type="number"
-                  min="1"
-                  className="number-input"
-                  style={{ width: "60px", padding: "6px" }}
-                  value={d.workers || 1}
-                  disabled={d.closed}
-                  onChange={(e) =>
-                    updateDay(d.day, { workers: Number(e.target.value) })
-                  }
-                />
-              </div>
-
-              <input
-                type="time"
-                className="time-input"
-                value={d.open}
-                disabled={d.closed}
-                onChange={(e) => updateDay(d.day, { open: e.target.value })}
-              />
-              <span className="hours-row__to">to</span>
-              <input
-                type="time"
-                className="time-input"
-                value={d.close}
-                disabled={d.closed}
-                onChange={(e) => updateDay(d.day, { close: e.target.value })}
-              />
-              {d.closed && <span className="hours-row__closed">Closed</span>}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="two-col">
-        <div className="panel-block">
-          <div className="panel-block__head">
-            <h2>Services offered today</h2>
+      <div className="settings-grid">
+        {/* Weekly Hours & Workforce Card */}
+        <div className="settings-card">
+          <div className="settings-card__head">
+            <h2>Weekly Hours & Workforce</h2>
+            <p>Manage store hours and simultaneous booking capacity.</p>
           </div>
-          <div className="service-list">
+          <div className="settings-card__body custom-scroll">
+            {config.daily_hours.map((d) => (
+              <div className="modern-hours-row" key={d.day}>
+                <div className="hours-header">
+                  <span className="hours-day-name">{d.day}</span>
+                  <Toggle
+                    checked={!d.closed}
+                    onChange={(e) =>
+                      updateDay(d.day, { closed: !e.target.checked })
+                    }
+                  />
+                </div>
+
+                {!d.closed ? (
+                  <div className="hours-controls">
+                    <div className="input-group">
+                      <label>Open</label>
+                      <input
+                        type="time"
+                        value={d.open}
+                        onChange={(e) =>
+                          updateDay(d.day, { open: e.target.value })
+                        }
+                      />
+                    </div>
+                    <div className="input-group">
+                      <label>Close</label>
+                      <input
+                        type="time"
+                        value={d.close}
+                        onChange={(e) =>
+                          updateDay(d.day, { close: e.target.value })
+                        }
+                      />
+                    </div>
+                    <div className="input-group">
+                      <label>Workers</label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={d.workers || 1}
+                        onChange={(e) =>
+                          updateDay(d.day, { workers: Number(e.target.value) })
+                        }
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="closed-badge">Closed</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Services Offered Card */}
+        <div className="settings-card">
+          <div className="settings-card__head">
+            <h2>Services Directory</h2>
+            <p>
+              Toggle which services the AI can currently offer to customers.
+            </p>
+          </div>
+          <div className="settings-card__body custom-scroll">
             {config.services.map((s) => (
-              <label className="service-row" key={s.name}>
-                <span>
-                  <span className="service-row__name">{s.name}</span>
-                  <span className="service-row__meta">
+              <div className="modern-service-row" key={s.name}>
+                <div className="modern-service-info">
+                  <span className="modern-service-name">{s.name}</span>
+                  <span className="modern-service-meta">
                     Rs. {s.price} · {s.duration_minutes} min
                   </span>
-                </span>
-                <input
-                  type="checkbox"
+                </div>
+                <Toggle
                   checked={!s.paused}
                   onChange={(e) =>
                     updateService(s.name, { paused: !e.target.checked })
                   }
                 />
-              </label>
+              </div>
             ))}
           </div>
         </div>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
-          <div className="panel-block" style={{ marginBottom: 0 }}>
-            <div className="panel-block__head">
-              <h2>AI Chat & Handoff</h2>
-            </div>
-            <div className="field-row field-row--toggle">
-              <label htmlFor="negotiation">
-                Enable AI Price Negotiation (Max 10%)
-              </label>
-              <input
-                id="negotiation"
-                type="checkbox"
+        {/* AI Chat & Handoff Card */}
+        <div className="settings-card">
+          <div className="settings-card__head">
+            <h2>AI Chat & Handoff</h2>
+            <p>Control how the AI negotiates and when it should escalate.</p>
+          </div>
+          <div className="settings-card__body settings-card__body--padded">
+            <div className="modern-field modern-field--toggle">
+              <div>
+                <label htmlFor="negotiation">AI Price Negotiation</label>
+                <div className="modern-field-desc">
+                  Allow AI to offer up to 10% discounts.
+                </div>
+              </div>
+              <Toggle
                 checked={config.enable_negotiation || false}
                 onChange={(e) =>
                   setConfig({ ...config, enable_negotiation: e.target.checked })
                 }
               />
             </div>
-            <div className="field-row">
-              <label htmlFor="handoff">
-                Auto-Handoff Message Limit <br />
-                <span style={{ fontSize: "0.8rem", color: "#6b7280" }}>
-                  (Triggers owner intervention for spam/lost context)
-                </span>
-              </label>
+
+            <div className="modern-field">
+              <label htmlFor="handoff">Auto-Handoff Message Limit</label>
+              <div className="modern-field-desc">
+                Stop AI and alert human after this many messages.
+              </div>
               <input
                 id="handoff"
                 type="number"
                 min="1"
                 className="number-input"
+                style={{ marginTop: "8px" }}
                 value={config.message_handoff_limit || 20}
                 onChange={(e) =>
                   setConfig({
@@ -1681,65 +1770,38 @@ function SettingsTab() {
               />
             </div>
           </div>
+        </div>
 
-          <div className="panel-block" style={{ marginBottom: 0 }}>
-            <div className="panel-block__head">
-              <h2>Capacity & Workflow</h2>
-            </div>
-            <div className="field-row">
-              <label htmlFor="cap">Max customers for the day</label>
-              <input
-                id="cap"
-                type="number"
-                min="0"
-                className="number-input"
-                placeholder="No limit"
-                value={config.daily_customer_cap ?? ""}
-                onChange={(e) =>
-                  setConfig({
-                    ...config,
-                    daily_customer_cap:
-                      e.target.value === "" ? null : Number(e.target.value),
-                  })
-                }
-              />
-            </div>
-            <div className="field-row">
-              <label htmlFor="buffer">Buffer between bookings (minutes)</label>
-              <input
-                id="buffer"
-                type="number"
-                min="0"
-                className="number-input"
-                value={config.buffer_minutes}
-                onChange={(e) =>
-                  setConfig({
-                    ...config,
-                    buffer_minutes: Number(e.target.value),
-                  })
-                }
-              />
-            </div>
-            <div className="field-row field-row--toggle">
-              <label htmlFor="manual">
-                Manual override (owner handling chats)
-              </label>
-              <input
-                id="manual"
-                type="checkbox"
+        {/* Capacity & Workflow Card */}
+        <div className="settings-card">
+          <div className="settings-card__head">
+            <h2>Capacity & Workflow</h2>
+            <p>Manage daily limits and backend booking approvals.</p>
+          </div>
+          <div className="settings-card__body settings-card__body--padded">
+            <div className="modern-field modern-field--toggle">
+              <div>
+                <label>Manual Override</label>
+                <div className="modern-field-desc">
+                  Pause AI globally. You handle all chats.
+                </div>
+              </div>
+              <Toggle
                 checked={config.manual_override}
                 onChange={(e) =>
                   setConfig({ ...config, manual_override: e.target.checked })
                 }
               />
             </div>
-            <div className="field-row field-row--toggle">
-              <label htmlFor="approve">
-                Approve bookings before confirming
-              </label>
-              <input
-                id="approve"
-                type="checkbox"
+
+            <div className="modern-field modern-field--toggle">
+              <div>
+                <label>Approve Before Confirm</label>
+                <div className="modern-field-desc">
+                  AI logs as "Pending". Owner must confirm.
+                </div>
+              </div>
+              <Toggle
                 checked={config.approve_before_confirm}
                 onChange={(e) =>
                   setConfig({
@@ -1749,15 +1811,52 @@ function SettingsTab() {
                 }
               />
             </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: "16px",
+                marginTop: "8px",
+              }}
+            >
+              <div className="modern-field">
+                <label htmlFor="cap">Daily Max Customers</label>
+                <input
+                  id="cap"
+                  type="number"
+                  min="0"
+                  className="number-input"
+                  placeholder="No limit"
+                  value={config.daily_customer_cap ?? ""}
+                  onChange={(e) =>
+                    setConfig({
+                      ...config,
+                      daily_customer_cap:
+                        e.target.value === "" ? null : Number(e.target.value),
+                    })
+                  }
+                />
+              </div>
+              <div className="modern-field">
+                <label htmlFor="buffer">Buffer (Minutes)</label>
+                <input
+                  id="buffer"
+                  type="number"
+                  min="0"
+                  className="number-input"
+                  value={config.buffer_minutes}
+                  onChange={(e) =>
+                    setConfig({
+                      ...config,
+                      buffer_minutes: Number(e.target.value),
+                    })
+                  }
+                />
+              </div>
+            </div>
           </div>
         </div>
-      </div>
-
-      <div className="settings-save">
-        <button className="save-btn" onClick={handleSave} disabled={saving}>
-          {saving ? "Saving…" : "Save changes"}
-        </button>
-        {savedFlash && <span className="settings-save__flash">Saved ✓</span>}
       </div>
     </div>
   )
@@ -1801,7 +1900,7 @@ export default function App() {
             conversations: conversationsQ.data.length,
           }}
         />
-        <main className="main">
+        <main className="main custom-scroll">
           {tab === "overview" && (
             <Overview
               bookings={bookingsQ.data}

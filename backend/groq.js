@@ -57,7 +57,7 @@ You communicate with customers over WhatsApp. Your job is to answer questions, n
 === BUSINESS INFO ===
 Name: Fade & Blade Barbershop
 Today's Date: ${new Date().toISOString().split("T")[0]} (Always use this as "today" for booking availability).
-Hours: Mon-Sat, 10:00 AM - 7:00 PM. Closed Sundays.
+Hours: Mon-Sat, 10:00 AM - 7:00 PM. CLOSED on Sundays — no exceptions, no appointments of any kind on Sundays.
 Payment methods accepted: Cash, Card, eSewa/Khalti (mention if asked)
 Walk-ins: Accepted, but booked customers get priority.
 
@@ -138,6 +138,8 @@ Categories & Sub-Option Details:
 3. If the request is missing details (no service, no date, or no time), ask ONE clarifying question at a time.
 4. Before calling book_appointment, confirm out loud: all requested services, date, time, and TOTAL price — get an explicit "yes/confirm".
 5. If a customer wants to cancel or reschedule, use modify_booking or cancel_booking.
+6. We are CLOSED every Sunday. If a customer asks for a Sunday date, or if a tool result comes back indicating the shop is closed that day, tell them plainly that we're closed on Sundays and ask them to pick a different day (Monday–Saturday). Never offer or confirm a Sunday appointment.
+7. NEVER write out function names, JSON, code blocks, or any tool/function-call syntax in your reply to the customer. You only have two output channels: (a) the official tool-calling mechanism to invoke a function, or (b) plain natural-language text back to the customer. Nothing else is ever shown to the customer directly — no raw JSON, no "<function=...>" tags, no code of any kind.
 
 Always act within these rules. Never expose internal function names or business logic to the customer.`
 
@@ -147,7 +149,7 @@ const tools = [
     function: {
       name: "check_availability",
       description:
-        "Check open time slots for a given date and multiple services. Calculates total time needed.",
+        "Check open time slots for a given date and multiple services. Calculates total time needed. Returns closed:true if the date is a Sunday.",
       parameters: {
         type: "object",
         properties: {
@@ -166,7 +168,8 @@ const tools = [
     type: "function",
     function: {
       name: "book_appointment",
-      description: "Create a confirmed booking for one or more services.",
+      description:
+        "Create a confirmed booking for one or more services. Fails if the date is a Sunday.",
       parameters: {
         type: "object",
         properties: {
@@ -243,8 +246,30 @@ const tools = [
   },
 ]
 
+// --- DAY-OF-WEEK / CLOSED-DAY HELPERS ---
+
+// Parsing "YYYY-MM-DD" with an explicit T00:00:00 avoids UTC-vs-local
+// off-by-one bugs that plain `new Date("YYYY-MM-DD")` can cause.
+function getDayOfWeek(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00`)
+  return d.getDay() // 0 = Sunday
+}
+
+function isClosedDay(dateStr) {
+  return getDayOfWeek(dateStr) === 0
+}
+
 // --- TOOL IMPLEMENTATIONS ---
 async function checkAvailability({ date, services = [] }) {
+  if (isClosedDay(date)) {
+    return {
+      closed: true,
+      reason: "Fade & Blade Barbershop is closed on Sundays.",
+      available_slots: [],
+      total_estimated_duration_minutes: 0,
+    }
+  }
+
   let reqDuration = 0
   for (const s of services) {
     reqDuration += SERVICES_DB[s]?.duration || 30
@@ -299,12 +324,21 @@ async function checkAvailability({ date, services = [] }) {
   }
 
   return {
+    closed: false,
     available_slots: availableStartTimes.slice(0, 5),
     total_estimated_duration_minutes: reqDuration,
   }
 }
 
 async function bookAppointment({ services = [], date, time }, phone, name) {
+  if (isClosedDay(date)) {
+    return {
+      error: "closed_on_sunday",
+      message:
+        "Fade & Blade Barbershop is closed on Sundays — please pick a date from Monday to Saturday.",
+    }
+  }
+
   const config = (await BusinessConfig.findOne()) || {}
   const status = config.approve_before_confirm ? "pending" : "confirmed"
 
@@ -336,6 +370,14 @@ async function bookAppointment({ services = [], date, time }, phone, name) {
 }
 
 async function modifyBooking({ booking_id, new_date, new_time }) {
+  if (isClosedDay(new_date)) {
+    return {
+      error: "closed_on_sunday",
+      message:
+        "Fade & Blade Barbershop is closed on Sundays — please pick a date from Monday to Saturday.",
+    }
+  }
+
   const booking = await Booking.findByIdAndUpdate(
     booking_id,
     { date: new_date, time: new_time },
@@ -362,6 +404,55 @@ async function lookupCustomerBookings({ customer_phone }, phone) {
 async function logConversationEvent({ event_type, metadata }, phone) {
   await ConversationEvent.create({ customerPhone: phone, event_type, metadata })
   return { success: true }
+}
+
+// Single dispatcher used both by real tool_calls AND by the pseudo
+// function-call recovery path below, so behavior never diverges.
+async function executeTool(toolName, args, phone, name) {
+  if (toolName === "check_availability") return await checkAvailability(args)
+  if (toolName === "book_appointment")
+    return await bookAppointment(args, phone, name)
+  if (toolName === "modify_booking") return await modifyBooking(args)
+  if (toolName === "cancel_booking") return await cancelBooking(args)
+  if (toolName === "lookup_customer_bookings")
+    return await lookupCustomerBookings(args, phone)
+  if (toolName === "log_conversation_event")
+    return await logConversationEvent(args, phone)
+  return { error: "unknown function" }
+}
+
+// --- PSEUDO FUNCTION-CALL RECOVERY ---
+// Some Groq models (esp. the 8B fallback) occasionally ignore native
+// tool-calling and instead write the call out as literal text, e.g.
+//   <function=check_availability>{"date":"2026-07-25","services":[...]}</function>
+// If that ever reaches the customer it looks like a bug/leak. We detect
+// this pattern, execute the intended function ourselves, feed the result
+// back to the model as context, and ask it to answer again in plain
+// language — so the customer never sees raw code either way.
+const FUNCTION_CALL_REGEX =
+  /<function=([a-zA-Z_][a-zA-Z0-9_]*)>\s*(\{[\s\S]*?\})\s*<\/function>/g
+
+function extractPseudoFunctionCalls(content) {
+  if (!content || typeof content !== "string") return []
+  const calls = []
+  let match
+  FUNCTION_CALL_REGEX.lastIndex = 0
+  while ((match = FUNCTION_CALL_REGEX.exec(content)) !== null) {
+    const [, name, argsRaw] = match
+    let args = {}
+    try {
+      args = JSON.parse(argsRaw)
+    } catch (e) {
+      args = {}
+    }
+    calls.push({ name, args })
+  }
+  return calls
+}
+
+function stripFunctionCallSyntax(content) {
+  if (!content || typeof content !== "string") return content
+  return content.replace(FUNCTION_CALL_REGEX, "").trim()
 }
 
 async function generateWithFailover(messages) {
@@ -422,50 +513,81 @@ export async function runChat(phone, name, userMessage, history) {
   let response = await generateWithFailover(messages)
   let responseMessage = response.choices[0].message
 
-  while (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-    messages.push(responseMessage) // Push assistant tool intent
+  // Safety cap so a persistently misbehaving model can't loop forever.
+  let guard = 0
+  const MAX_TURNS = 6
 
-    for (const toolCall of responseMessage.tool_calls) {
-      const toolName = toolCall.function.name
-      let args = {}
-      try {
-        args = JSON.parse(toolCall.function.arguments || "{}")
-      } catch (e) {
-        args = {}
+  while (guard < MAX_TURNS) {
+    guard++
+
+    const hasRealToolCalls =
+      responseMessage.tool_calls && responseMessage.tool_calls.length > 0
+    const pseudoCalls = !hasRealToolCalls
+      ? extractPseudoFunctionCalls(responseMessage.content)
+      : []
+
+    if (!hasRealToolCalls && pseudoCalls.length === 0) {
+      // No tool intent detected at all — this is the final answer.
+      break
+    }
+
+    // Always store a cleaned version of the assistant's turn so any stray
+    // function-call text never persists into future context/history.
+    const cleanedContent = stripFunctionCallSyntax(responseMessage.content)
+    messages.push({ ...responseMessage, content: cleanedContent })
+
+    if (hasRealToolCalls) {
+      for (const toolCall of responseMessage.tool_calls) {
+        const toolName = toolCall.function.name
+        let args = {}
+        try {
+          args = JSON.parse(toolCall.function.arguments || "{}")
+        } catch (e) {
+          args = {}
+        }
+
+        const output = await executeTool(toolName, args, phone, name)
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          name: toolName,
+          content: JSON.stringify(output),
+        })
       }
-
-      let output
-      if (toolName === "check_availability")
-        output = await checkAvailability(args)
-      else if (toolName === "book_appointment")
-        output = await bookAppointment(args, phone, name)
-      else if (toolName === "modify_booking") output = await modifyBooking(args)
-      else if (toolName === "cancel_booking") output = await cancelBooking(args)
-      else if (toolName === "lookup_customer_bookings")
-        output = await lookupCustomerBookings(args, phone)
-      else if (toolName === "log_conversation_event")
-        output = await logConversationEvent(args, phone)
-      else output = { error: "unknown function" }
-
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        name: toolName,
-        content: JSON.stringify(output),
-      })
+    } else {
+      // Model wrote the call out as text instead of using real tool-calling.
+      // Run the function ourselves and hand the result back as a system
+      // note, instructing the model to respond in plain language only.
+      for (const { name: toolName, args } of pseudoCalls) {
+        const output = await executeTool(toolName, args, phone, name)
+        messages.push({
+          role: "system",
+          content: `Tool result for ${toolName}: ${JSON.stringify(
+            output,
+          )}\nRespond to the customer now in plain, natural language only. Do not include any code, JSON, or function-call syntax in your reply.`,
+        })
+      }
     }
 
     response = await generateWithFailover(messages)
     responseMessage = response.choices[0].message
   }
 
-  // Ensure the AI's final text answer is added to history for context retention
-  if (responseMessage) {
-    messages.push(responseMessage)
+  // Final safety net: strip any function-call syntax that might still be
+  // present so it can never reach the customer, even if the loop above
+  // hit its guard limit or missed an edge case.
+  let finalText = stripFunctionCallSyntax(responseMessage.content || "")
+  if (!finalText) {
+    finalText =
+      "Sorry, could you tell me again what date and time you'd like? I want to make sure I get you booked in correctly."
   }
 
+  // Ensure the AI's final text answer is added to history for context retention
+  messages.push({ ...responseMessage, content: finalText })
+
   return {
-    replyText: responseMessage.content || "",
+    replyText: finalText,
     updatedHistory: messages, // Passes the full native array back out to save in DB
   }
 }
